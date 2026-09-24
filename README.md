@@ -1,71 +1,94 @@
-# High-Concurrency Distributed URL Shortener
+# Scalable URL Shortener
 
-A production-grade, distributed URL shortener architected for maximum throughput, low latency, and high availability. Built with FastAPI, PostgreSQL, and Redis, the system is containerized via Docker and horizontally scaled behind an Nginx reverse proxy.
+A URL shortener built with FastAPI, PostgreSQL, and Redis, containerized with
+Docker and served through an Nginx reverse proxy. Horizontally scaled to 3 API
+instances and load-tested with Locust. Built as a learning project to practice
+async APIs, caching, rate limiting, and stress testing.
 
-## 🚀 System Architecture
+## Architecture
 
-* **API Layer:** 3x horizontally scaled FastAPI instances running asynchronously.
-* **Load Balancer:** Nginx distributing incoming HTTP traffic evenly across API nodes (Round Robin).
-* **Primary Database:** PostgreSQL utilizing `asyncpg` connection pooling for highly efficient, concurrent disk writes.
-* **Caching & Rate Limiting:** Redis deployed as an in-memory datastore to intercept read traffic and manage atomic state.
+```mermaid
+flowchart LR
+    C[Client] --> N[Nginx :8080]
+    N -->|round-robin| A1[FastAPI api-1]
+    N -->|round-robin| A2[FastAPI api-2]
+    N -->|round-robin| A3[FastAPI api-3]
+    A1 --> R[(Redis)]
+    A2 --> R
+    A3 --> R
+    A1 --> P[(PostgreSQL)]
+    A2 --> P
+    A3 --> P
+```
 
-## 🛡️ Enterprise-Grade Features
+- **API:** FastAPI on uvicorn (async), 3 instances behind Nginx
+- **Database:** PostgreSQL 15 via `asyncpg` connection pool
+- **Cache:** Redis 7 as a cache-aside layer for reads and rate-limit state
+- **Proxy:** Nginx using Docker's embedded DNS (`127.0.0.11`) with a variable in `proxy_pass` to re-resolve the `api` hostname per request — this enables real round-robin across scaled containers
+- **Containerization:** Docker Compose
 
-* **Cache Hit/Miss Routing:** 99% of read traffic is intercepted by Redis, returning redirects in sub-millisecond times and protecting the PostgreSQL database from heavy load.
-* **Cache Penetration Defense:** Automatically detects and caches `404 Not Found` results (fake URLs) for 60 seconds, preventing malicious actors from overwhelming the database with bogus queries.
-* **Atomic Rate Limiting:** Implements O(1) IP-based rate limiting via Redis `incr()`, preventing API abuse (max 5 requests per minute, per IP) without race conditions.
-* **Collision-Resistant Inserts:** Catches PostgreSQL `UniqueViolationError` exceptions during URL generation and implements an automatic retry loop for self-healing conflict resolution.
-* **Clean Architecture:** Modular separation of concerns (`main.py`, `routes.py`, `database.py`, `schemas.py`) utilizing FastAPI lifespan events for safe connection teardowns.
+## Endpoints
 
-## 📊 Load Testing & Performance Metrics
+| Method | Path | Description |
+|---|---|---|
+| GET | `/` | Health check. Returns hostname, DB/Redis status. |
+| POST | `/shorten` | Body: `{"url": "https://..."}`. Returns short URL. |
+| GET | `/{short_code}` | Redirects (307) to original URL, or 404. |
 
-The architecture was stress-tested locally using **Locust** to evaluate the routing efficiency of the Nginx load balancer distributing traffic across the scaled FastAPI nodes with zero simulated user delay (`wait_time = constant(0)`).
+Interactive docs at `/docs`.
 
-**Test Parameters:**
-* **Peak Concurrent Users:** 2,000 (Ramp-up: 20 users/second)
-* **Duration:** 2 minutes, 2 seconds
-* **Traffic Distribution:** 75% Cache Hit (`GET /M7vmhH`), 25% Health Check (`GET /`)
-* **Hardware Environment:** AMD Ryzen 5 5600H CPU, 24GB DDR4 RAM (~4.8GB available during peak execution), 512GB NVMe SSD
+## Features
 
-**Results:**
-* **Total Requests Handled:** 111,005 requests
-* **Throughput:** Sustained **905.10 Requests Per Second (RPS)**
-* **Global Success Rate:** 95.74%
-* **System Reliability:** 100% Core Stability (Zero server-side `500 Internal Server Errors` or application logic crashes; all 4.26% failures were environmental network drops).
+- **Cache-aside redirects:** `GET /{short_code}` checks Redis first; on miss, queries PostgreSQL and caches the result for 10 minutes.
+- **IP-based rate limiting:** `POST /shorten` uses Redis `INCR` + `EXPIRE` — atomic, O(1), capped at 5 requests per minute per IP.
+- **Collision-resistant codes:** 6-character codes from `[A-Za-z0-9]` using `secrets.choice`. Insert retries on PostgreSQL `UniqueViolationError`.
+- **Async connection pooling:** `asyncpg` pool reused across requests via FastAPI `lifespan`.
+- **Race-safe schema creation:** API containers handle concurrent `CREATE TABLE IF NOT EXISTS` via try/except on `DuplicateTableError`.
+## Load Testing Results
 
-### ⏱️ Latency Percentiles (Response Times)
+Tested with **Locust** against `GET /`. Windows host, AMD Ryzen 5 5600H, 24 GB RAM. All containers on the same machine.
 
-| Endpoint | 50%ile | 70%ile | 90%ile | 95%ile | 99%ile | 100%ile (Max) |
-| :--- | :--- | :--- | :--- | :--- | :--- | :--- |
-| `GET /` (Health Check) | 110 ms | 150 ms | 310 ms | 6,600 ms | 15,000 ms | 16,000 ms |
-| `GET /M7vmhH` (Cache Hit) | 110 ms | 150 ms | 310 ms | 6,500 ms | 15,000 ms | 16,000 ms |
-| **Aggregated Performance** | **110 ms** | **150 ms** | **310 ms** | **6,500 ms** | **15,000 ms** | **16,000 ms** |
+| Users | RPS | Failures | Failure Rate | Median | 95%ile | Verdict |
+|---|---|---|---|---|---|---|
+| 200 | 647 | 0 | 0% | 5 ms | 17 ms | ✅ Clean |
+| 500 | 934 | 294 | 0.4% | 110 ms | 16 s | ⚠️ Peak |
+| 1000 | 685 | 485 | 1.3% | 200 ms | 16 s | ❌ Degrading |
+| 2000 | 662 | 6,776 | 15% | 230 ms | 20 s | ❌ Saturated |
+| 5000 | 714 | 12,190 | 27% | 230 ms | 21 s | ❌ Dead |
 
----
+**Peak clean run:** 200 users — 647 RPS, 0 failures, 5 ms median.
+**Peak stressed run:** 500 users — 934 RPS, before Windows loopback port exhaustion.
 
-### 🔍 Error & Bottleneck Analysis
+### Failure analysis
 
-While the API layer maintained a highly efficient, sub-310ms latency profile for up to **90% of all concurrent traffic**, the architecture encountered physical system and host operating system thresholds at absolute peak load:
+Above ~500 users, failures appear. Breaking them down:
 
-1. **Host OS Ephemeral Port Exhaustion (`ConnectionAbortedError: 10053`)**
-   * **Root Cause:** Making up the vast majority of all failures (4,555 requests), this occurred because both the load generator (Locust) and the system (Nginx/Docker containers) were competing for sockets on the same local Windows loopback adapter. The Windows network stack exhausted its ephemeral port pool and forcefully dropped active client connections.
-2. **Event-Loop Congestion & Memory Swapping (`RemoteDisconnected`)**
-   * **Root Cause:** A small fraction of requests (178 occurrences) encountered direct disconnects. As the containerized architecture pushed past the 90th percentile, the extreme traffic saturated the remaining 4.8GB of physical RAM, forcing the host Windows OS to swap virtual memory pages to the SSD (`Page File Memory`). This introduced a steep latency cliff at the 95th percentile, causing minor request buffering until the connection timed out at the application boundary.
+- **`ConnectionAbortedError 10053`** (~85%) — Windows killed the socket. Caused by ephemeral port exhaustion because Locust and the Docker containers compete for ports on the same loopback adapter.
+- **`RemoteDisconnected`** (~14%) — connection closed while waiting for a response, likely from event-loop congestion and page-file swapping under memory pressure.
+- **`ConnectionResetError 10054`** (~1%) — same root cause as above.
 
-*Note: The load test confirms that the Dockerized application logic, Redis cache intercept, and Nginx reverse proxy successfully withstand high-velocity stress. Deploying this system out of a local Windows loopback environment into a true distributed Linux production environment will instantly eliminate these specific OS socket drop behaviors and clear the 95th percentile latency queue.*
+**Zero `500 Internal Server Error` from the application** across all runs. All failures are environmental (Windows host limits), not application bugs.
 
-# Project Commands
-- Start the system (with 3 API nodes): docker-compose up --build -d --scale api=3
-- Shut down the system: docker-compose down
-- Run unit tests: docker-compose exec api pytest- View live Nginx errors: docker-compose logs nginx
-- Open PostgreSQL shell: docker-compose exec db psql -U postgres -d url_db
-- Start Locust load test: python -m locust -f locustfile.py
-- View live API logs: docker-compose logs -f api    
-- View live Nginx logs: docker-compose logs -f nginx
+On a real Linux host with separate client and server machines, these failures would not occur, and the ceiling would be determined by the API containers rather than the load generator.
+ 
+## Project Commands
 
+```bash
+# Start the system with 3 API containers
+docker-compose up --build -d --scale api=3
 
+# Shut down the system
+docker-compose down
 
+# View live API logs
+docker-compose logs -f api
 
+# View live Nginx logs
+docker-compose logs -f nginx
 
+# Open PostgreSQL shell
+docker-compose exec db psql -U postgres -d url_db
 
-
+# Start Locust load test (GUI at http://localhost:8089)
+python -m locust -f locustfile.py --host=http://localhost:8080
+```
